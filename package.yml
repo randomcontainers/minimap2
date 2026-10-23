@@ -1,0 +1,197 @@
+name: minimap2
+title: Minimap2
+summary: Aligns long and short DNA reads, assembly contigs and spliced RNA sequences to a reference genome, writing SAM or PAF.
+homepage: https://github.com/lh3/minimap2
+# Minimap2 is MIT. The klib headers it includes and the sse2neon header used
+# on arm64 are MIT too. ksw2_dispatch.c, compiled on amd64, has a few lines of
+# cpuid inline assembly adapted from Intel's linux-sgx (BSD-3-Clause). Minimap2
+# ships them without Intel's notice, so licenses/LICENSE.linux-sgx has it.
+license: MIT AND BSD-3-Clause
+upstream:
+  source: github-release
+  repository: lh3/minimap2
+  # Release tags look like v2.31; v2.1.1 had a point number. v2.0rc1 and
+  # r191 do not match.
+  tag-pattern: '^v(\d+\.\d+(?:\.\d+)?)$'
+  version-template: '{1}'
+  versioning: semver
+  version: "2.31"
+  # Upstream publishes no checksums or signatures, so the reconciler pins
+  # the digest GitHub records for the release asset.
+  artifact:
+    url: https://github.com/lh3/minimap2/releases/download/v{version}/minimap2-{version}.tar.bz2
+    sha256: c1351de6319c123369c2f4f37ba0ccf18c7ace47e2b1c0a35e30056b4a3bd9c9
+image:
+  entrypoint: [minimap2]
+  cmd: [--help]
+test:
+  - |
+    minimap2 --version > version.txt
+    v=$(cat version.txt)
+    case "$v" in
+      "$VERSION"-r[0-9]*) ;;
+      *) echo "expected $VERSION-r<revision>, got '$v'" >&2; exit 1 ;;
+    esac
+    minimap2 --help > help.txt
+    grep -Fq 'Usage: minimap2 [options]' help.txt || { cat help.txt >&2; echo 'expected the usage text' >&2; exit 1; }
+  - |
+    # A random 50 kb reference from a fixed linear congruential generator. The
+    # numbers stay below 2^53, so mawk and busybox awk give the same bases.
+    awk 'BEGIN {
+      s = 1
+      for (i = 0; i < 50000; i++) {
+        s = (s * 69069 + 1) % 4294967296
+        printf "%s", substr("ACGT", int(s / 1073741824) + 1, 1)
+      }
+      print ""
+    }' > ref.txt
+    awk '{ print ">chr1"; for (i = 1; i <= length($0); i += 60) print substr($0, i, 60) }' ref.txt > ref.fa
+    at() { cut -c "$1-$2" ref.txt; }
+    revcomp() { awk '{ s = ""; for (i = length($0); i > 0; i--) s = s substr("TGCA", index("ACGT", substr($0, i, 1)), 1); print s }'; }
+    # Reads taken from the reference: one as is, one reverse complemented, one
+    # with five bases deleted, and one in lower case for its first 100 bases
+    # and with N at three places. The deleted bases cannot move along the
+    # reference without a mismatch, so the gap has one place.
+    {
+      printf '>fwd\n%s\n' "$(at 10001 12000)"
+      printf '>rev\n%s\n' "$(at 30001 32000 | revcomp)"
+      printf '>del\n%s%s\n' "$(at 20001 21000)" "$(at 21006 22005)"
+      at 40001 41000 | awk '{
+        s = tolower(substr($0, 1, 100)) substr($0, 101)
+        s = substr(s, 1, 299) "N" substr(s, 301, 199) "N" substr(s, 501, 199) "N" substr(s, 701)
+        print ">mixed"; print s
+      }'
+    } > reads.fa
+    minimap2 -a -o aln.sam ref.fa reads.fa 2> minimap2.log || { cat minimap2.log >&2; exit 1; }
+    grep -Fqx "$(printf '@SQ\tSN:chr1\tLN:50000')" aln.sam || { grep '^@' aln.sam >&2; echo 'expected @SQ for chr1' >&2; exit 1; }
+    awk -F '\t' '!/^@/ {
+      nm = "-"
+      for (i = 12; i <= NF; i++) if ($i ~ /^NM:i:/) nm = $i
+      if ($1 == "mixed") nm = "-"
+      print $1, $2, $3, $4, $6, nm
+    }' aln.sam > got.txt
+    printf '%s\n' 'fwd 0 chr1 10001 2000M NM:i:0' 'rev 16 chr1 30001 2000M NM:i:0' \
+      'del 0 chr1 20001 1000M5D1000M NM:i:5' 'mixed 0 chr1 40001 1000M -' > expected.txt
+    cmp expected.txt got.txt || { echo expected: >&2; cat expected.txt >&2; echo got: >&2; cat got.txt >&2; exit 1; }
+  - |
+    same() { [ "$1" = "$2" ] || { echo "$3: got '$1', expected '$2'" >&2; exit 1; }; }
+    mm() { minimap2 "$@" 2> minimap2.log || { cat minimap2.log >&2; echo "minimap2 $* failed" >&2; exit 1; }; }
+    # PAF with base-level alignment and the cs tag, which spells out the
+    # deleted bases.
+    mm -c --cs -o aln.paf ref.fa reads.fa
+    awk -F '\t' '$1 == "del"' aln.paf > del.paf
+    same "$(cut -f 1-11 del.paf)" "$(printf 'del\t2000\t0\t2000\t+\tchr1\t50000\t20000\t22005\t2000\t2005')" 'del in PAF'
+    same "$(tr '\t' '\n' < del.paf | grep '^cs:Z:')" "cs:Z::1000-$(cut -c 21001-21005 ref.txt | tr ACGT acgt):1000" 'cs tag of del'
+    # A saved index and gzip-compressed reads give the same alignments.
+    mm -d ref.mmi ref.fa
+    mm -a -o from-index.sam ref.mmi reads.fa
+    gzip -c reads.fa > reads.fa.gz
+    mm -a -o from-gz.sam ref.fa reads.fa.gz
+    grep -v '^@' aln.sam | cut -f 1-11 > direct.txt
+    for f in from-index from-gz; do
+      grep -v '^@' "$f.sam" | cut -f 1-11 > "$f.txt"
+      cmp direct.txt "$f.txt" || { echo expected: >&2; cat direct.txt >&2; echo "got from $f:" >&2; cat "$f.txt" >&2; exit 1; }
+    done
+  - |
+    # 400 reads of 1 kb from known places, every other one reverse
+    # complemented, mapped as nanopore reads with four threads. Each name
+    # carries the read's number and its 0-based start.
+    awk '
+      function revcomp(x,   i, y) {
+        y = ""
+        for (i = length(x); i > 0; i--) y = y substr("TGCA", index("ACGT", substr(x, i, 1)), 1)
+        return y
+      }
+      {
+        q = ""
+        for (i = 0; i < 1000; i++) q = q "I"
+        for (n = 0; n < 400; n++) {
+          p = (n * 1201) % 49000
+          r = substr($0, p + 1, 1000)
+          if (n % 2) r = revcomp(r)
+          printf "@r%d_%d\n%s\n+\n%s\n", n, p, r, q
+        }
+      }' ref.txt > reads.fq
+    minimap2 -x map-ont -t 4 -c --secondary=no -o reads.paf ref.fa reads.fq 2> minimap2.log \
+      || { cat minimap2.log >&2; exit 1; }
+    awk -F '\t' '{
+      split(substr($1, 2), f, "_")
+      strand = f[1] % 2 ? "-" : "+"
+      if ($2 == 1000 && $3 == 0 && $4 == 1000 && $5 == strand && $6 == "chr1" && $8 == f[2] && $9 == f[2] + 1000) ok[$1] = 1
+      else print "misplaced: " $0
+    }
+    END { n = 0; for (k in ok) n++; print NR " lines, " n " reads in place" }' reads.paf > placed.txt
+    if [ "$(cat placed.txt)" != '400 lines, 400 reads in place' ]; then
+      cat placed.txt >&2; echo 'expected 400 lines, 400 reads in place' >&2; exit 1
+    fi
+  - |
+    same() { [ "$1" = "$2" ] || { echo "$3: got '$1', expected '$2'" >&2; exit 1; }; }
+    mm() { minimap2 "$@" 2> minimap2.log || { cat minimap2.log >&2; echo "minimap2 $* failed" >&2; exit 1; }; }
+    # A 20 kb contig from the reference, aligned as an assembly.
+    printf '>contig\n%s\n' "$(cut -c 25001-45000 ref.txt)" > contig.fa
+    mm -x asm5 -c -o asm.paf ref.fa contig.fa
+    same "$(cut -f 1-11 asm.paf)" "$(printf 'contig\t20000\t0\t20000\t+\tchr1\t50000\t25000\t45000\t20000\t20000')" 'contig in PAF'
+    # A gene with two 1 kb exons around a 3 kb GT-AG intron, and its spliced
+    # transcript. The first exon does not end with G and the second does not
+    # start with G, so the junction has one place.
+    e1=$(cut -c 1001-2000 ref.txt)
+    e2=$(cut -c 5001-6000 ref.txt)
+    printf '>gene\n%sGT%sAG%s\n' "$e1" "$(cut -c 2001-4996 ref.txt)" "$e2" > gene.fa
+    printf '>tx\n%s%s\n' "$e1" "$e2" > tx.fa
+    mm -x splice -a -o tx.sam gene.fa tx.fa
+    same "$(awk -F '\t' '!/^@/ { print $1, $2, $3, $4, $6 }' tx.sam)" 'tx 0 gene 1 1000M3000N1000M' 'spliced alignment'
+  - |
+    same() { [ "$1" = "$2" ] || { echo "$3: got '$1', expected '$2'" >&2; exit 1; }; }
+    # A pair of 150 bp reads from the two ends of a 400 bp fragment, the
+    # second one on the reverse strand, mapped as paired short reads.
+    q=$(printf '%150s' '' | tr ' ' I)
+    printf '@pair\n%s\n+\n%s\n' "$(cut -c 15001-15150 ref.txt)" "$q" > r1.fq
+    cut -c 15251-15400 ref.txt \
+      | awk -v q="$q" '{ s = ""; for (i = length($0); i > 0; i--) s = s substr("TGCA", index("ACGT", substr($0, i, 1)), 1); printf "@pair\n%s\n+\n%s\n", s, q }' > r2.fq
+    minimap2 -x sr -a -o pair.sam ref.fa r1.fq r2.fq 2> minimap2.log || { cat minimap2.log >&2; exit 1; }
+    awk -F '\t' '!/^@/ { print $1, $2, $3, $4, $6, $7, $8, $9 }' pair.sam > got.txt
+    printf '%s\n' 'pair 99 chr1 15001 150M = 15251 400' 'pair 147 chr1 15251 150M = 15001 -400' > expected.txt
+    cmp expected.txt got.txt || { echo expected: >&2; cat expected.txt >&2; echo got: >&2; cat got.txt >&2; exit 1; }
+examples:
+  - title: Map nanopore reads to a reference and write SAM
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/minimap2 -ax map-ont -t 8 -o aln.sam ref.fa reads.fq.gz
+  - title: Map PacBio HiFi reads and sort the alignments into an indexed BAM file
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" --entrypoint sh ghcr.io/randomcontainers/minimap2 -c 'minimap2 -ax map-hifi -t 8 ref.fa reads.fq.gz | samtools sort -o aln.bam --write-index -'
+  - title: Save an index for a reference
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/minimap2 -x map-ont -d ref.mmi ref.fa
+  - title: Align an assembly to a reference and write PAF with the cs tag
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/minimap2 -cx asm5 --cs -o asm.paf ref.fa asm.fa
+  - title: Align spliced long reads from RNA
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/minimap2 -ax splice -o rna.sam ref.fa rna.fq.gz
+combos:
+  - with: [samtools]
+    default: true
+    base: samtools
+    summary: Minimap2 with Samtools, for aligning long reads and sorting and indexing the alignments as BAM.
+    test:
+      - |
+        # Ten 1 kb reads tiling a 10 kb reference, written in reverse order,
+        # piped from minimap2 into samtools sort.
+        awk 'BEGIN {
+          s = 7
+          for (i = 0; i < 10000; i++) {
+            s = (s * 69069 + 1) % 4294967296
+            printf "%s", substr("ACGT", int(s / 1073741824) + 1, 1)
+          }
+          print ""
+        }' > ref.txt
+        awk '{ print ">chr1"; for (i = 1; i <= length($0); i += 60) print substr($0, i, 60) }' ref.txt > ref.fa
+        awk '{ for (p = 9001; p >= 1; p -= 1000) printf ">r%d\n%s\n", p, substr($0, p, 1000) }' ref.txt > reads.fa
+        if ! minimap2 -a ref.fa reads.fa 2> minimap2.log | samtools sort -o aln.bam - 2> sort.log \
+          || ! samtools quickcheck aln.bam; then
+          cat minimap2.log sort.log >&2; echo 'expected a BAM file from minimap2 and samtools sort' >&2; exit 1
+        fi
+        samtools index aln.bam
+        samtools view aln.bam | cut -f 1,4,6 > got.txt
+        awk 'BEGIN { for (p = 1; p <= 9001; p += 1000) printf "r%d\t%d\t1000M\n", p, p }' > expected.txt
+        cmp expected.txt got.txt || { echo expected: >&2; cat expected.txt >&2; echo got: >&2; cat got.txt >&2; exit 1; }
+        n=$(samtools view -c aln.bam chr1:4500-5500)
+        [ "$n" = 2 ] || { echo "reads in chr1:4500-5500: got $n, expected 2" >&2; exit 1; }
+        if ! samtools view -H aln.bam | grep -q "^@PG.ID:minimap2.*VN:$VERSION-r"; then
+          samtools view -H aln.bam >&2; echo "expected minimap2 $VERSION in the @PG lines" >&2; exit 1
+        fi
