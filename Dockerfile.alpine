@@ -1,0 +1,139 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=alpine:3.24
+
+FROM ${BASE_IMAGE} AS build
+SHELL ["/bin/ash", "-euo", "pipefail", "-c"]
+RUN apk add --no-cache \
+      build-base \
+      curl \
+      scanelf \
+      zlib-dev
+
+ARG VERSION
+ARG SOURCE_SHA256
+RUN printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+(\.[0-9]+)?' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    printf '%s\n' "${SOURCE_SHA256}" | grep -Eqx '[0-9a-f]{64}' \
+      || { echo "SOURCE_SHA256 must be the tarball's sha256" >&2; exit 1; }; \
+    url="https://github.com/lh3/minimap2/releases/download/v${VERSION}/minimap2-${VERSION}.tar.bz2"; \
+    curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 -o /tmp/minimap2.tar.bz2 "$url"; \
+    echo "${SOURCE_SHA256}  /tmp/minimap2.tar.bz2" | sha256sum -c -; \
+    mkdir /src; \
+    tar -xjf /tmp/minimap2.tar.bz2 -C /src --strip-components=1; \
+    rm /tmp/minimap2.tar.bz2; \
+    echo "$url" > /tmp/source-url
+
+# The Makefile sets CFLAGS and CPPFLAGS itself (-DHAVE_KALLOC, and
+# -fsigned-char on arm64); setting either on the make command line would
+# replace them, so only the architecture switches and CC are passed. On
+# x86-64 the alignment kernels are built for SSE2 and SSE4.1 and the faster
+# one is picked at run time. On arm64 they are built for NEON through the
+# bundled sse2neon header. The compile lines in the make log are checked for
+# the flags. musl gives new threads 128 KiB of stack; the link line ignores
+# LDFLAGS, so -z stack-size goes in through CC and raises the default to
+# glibc's 8 MiB.
+ARG JOBS
+WORKDIR /src
+RUN cc='cc -Wl,-z,stack-size=8388608'; \
+    case "$(uname -m)" in \
+      x86_64) \
+        set -- "CC=$cc" minimap2; \
+        kernels='ksw2_dispatch.o ksw2_extz2_sse41.o ksw2_extd2_sse41.o ksw2_exts2_sse41.o ksw2_extz2_sse2.o ksw2_extd2_sse2.o ksw2_exts2_sse2.o'; \
+        flags='-DHAVE_KALLOC' ;; \
+      aarch64) \
+        set -- "CC=$cc" arm_neon=1 aarch64=1 minimap2; \
+        kernels='ksw2_extz2_neon.o ksw2_extd2_neon.o ksw2_exts2_neon.o'; \
+        flags='-DHAVE_KALLOC -fsigned-char' ;; \
+      *) echo "unexpected machine: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    echo "make $*" > /tmp/make-line; \
+    make -j"${JOBS:-$(nproc)}" "$@" 2>&1 | tee /tmp/make.log; \
+    grep -E ' -c .* -o [^ ]+\.o$' /tmp/make.log > /tmp/compile-lines \
+      || { echo 'found no compile lines in the make log' >&2; exit 1; }; \
+    for f in $flags; do \
+      if grep -v -F -e " $f " /tmp/compile-lines; then echo "the lines above were compiled without $f" >&2; exit 1; fi; \
+    done; \
+    for o in $kernels; do \
+      test -f "$o" || { echo "$o was not built" >&2; exit 1; }; \
+    done; \
+    stack=$(readelf -lW minimap2 | awk '$1 == "GNU_STACK" { print $6 }'); \
+    if [ "$stack" != 0x800000 ]; then echo "expected a GNU_STACK size of 0x800000, got '$stack'" >&2; exit 1; fi
+
+ARG BASE_IMAGE
+# Only the minimap2 program is installed. The static library it is linked
+# from stays here, sdust and minimap2-lite are not built, and
+# misc/paftools.js needs the k8 JavaScript shell. The smoke test is the one
+# in upstream's README. NOTICES takes from each C file its first comment
+# with a copyright line. LICENSE.sse2neon is the contributor list and
+# license of the sse2neon header, which is compiled in on arm64 only but
+# shipped on both. LICENSE.linux-sgx, from licenses/, is Intel's notice for
+# the cpuid code that ksw2_dispatch.c adapts from linux-sgx without it; that
+# code is compiled on amd64 only, and the notice is shipped on both as well.
+# runtime-deps lists the so: names minimap2 needs, plus the packages in
+# runtime-deps.alpine.
+RUN --mount=type=bind,source=runtime-deps.alpine,target=/tmp/runtime-deps.extra \
+    --mount=type=bind,source=licenses/LICENSE.linux-sgx,target=/tmp/LICENSE.linux-sgx \
+    ./minimap2 --version > /tmp/minimap2-version; \
+    case "$(cat /tmp/minimap2-version)" in \
+      "${VERSION}"-r[0-9]*) ;; \
+      *) cat /tmp/minimap2-version >&2; echo "expected ${VERSION}-r<revision>" >&2; exit 1 ;; \
+    esac; \
+    ./minimap2 -a test/MT-human.fa test/MT-orang.fa > /tmp/mt.sam 2> /tmp/mt.log \
+      || { cat /tmp/mt.log >&2; exit 1; }; \
+    if ! awk -F '\t' '$1 == "MT_orang" && ($2 == 0 || $2 == 16) && $3 == "MT_human" { n++ } END { exit (n != 1) }' /tmp/mt.sam; then \
+      cat /tmp/mt.sam >&2; echo 'expected one primary alignment of MT_orang to MT_human' >&2; exit 1; \
+    fi; \
+    install -D -m 755 minimap2 /out/usr/local/bin/minimap2; \
+    strip --strip-unneeded /out/usr/local/bin/minimap2; \
+    meta=/out/usr/local/share/randomcontainers/minimap2; \
+    mkdir -p "$meta/licenses"; \
+    cp LICENSE.txt "$meta/licenses/LICENSE.txt"; \
+    for f in *.c *.h; do \
+      awk -v f="$f" '/\/\*/ { c = 1; b = "" } c { b = b $0 "\n" } \
+        c && /\*\// { c = 0; if (b ~ /[Cc]opyright (\([Cc]\) )?[0-9A-Z]/) { printf "==> %s <==\n%s\n", f, b; exit } }' "$f"; \
+    done > "$meta/licenses/NOTICES"; \
+    for f in khash.h kseq.h ksort.h kvec.h krmq.h; do \
+      grep -Fqx "==> $f <==" "$meta/licenses/NOTICES" || { echo "NOTICES lacks $f" >&2; exit 1; }; \
+    done; \
+    awk '/^\/\/ Contributors to this project are:/ { p = 1 } p && /^\/\/ \*\*\*/ { p = 0 } \
+      /^\*\* The MIT license:/ { m = 1; print prev } p || m { print } m && /^\*\// { exit } { prev = $0 }' \
+      sse2neon/emmintrin.h > "$meta/licenses/LICENSE.sse2neon"; \
+    for s in 'John W. Ratcliff' 'Hasindu Gamaarachchi' 'The MIT license:' 'THE SOFTWARE IS PROVIDED'; do \
+      grep -Fq "$s" "$meta/licenses/LICENSE.sse2neon" || { echo "could not cut the sse2neon license: no '$s'" >&2; exit 1; }; \
+    done; \
+    grep -Fq 'linux-sgx' ksw2_dispatch.c \
+      || { echo 'ksw2_dispatch.c no longer mentions linux-sgx: check licenses/LICENSE.linux-sgx and the license label' >&2; exit 1; }; \
+    cp /tmp/LICENSE.linux-sgx "$meta/licenses/LICENSE.linux-sgx"; \
+    grep -Fq 'Intel Corporation' "$meta/licenses/LICENSE.linux-sgx"; \
+    echo "${VERSION}" > "$meta/version"; \
+    cp /tmp/source-url "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "source-sha256: ${SOURCE_SHA256}"; \
+      echo "compiler: $(cc --version | head -n 1)"; \
+      cat /tmp/make-line; \
+      echo "compile line: $(grep -E ' main\.c -o main\.o$' /tmp/compile-lines)"; \
+      echo "minimap2 --version: $(cat /tmp/minimap2-version)"; \
+    } > "$meta/buildinfo"; \
+    scanelf --needed --nobanner --format '%n#p' --recursive /out/usr/local | tr ',' '\n' | LC_ALL=C sort -u > /tmp/needed; \
+    grep -q '^libz\.so\.' /tmp/needed || { cat /tmp/needed >&2; echo 'minimap2 does not load zlib' >&2; exit 1; }; \
+    while read -r so; do \
+      if [ -n "$so" ] && [ -z "$(find /out -name "$so" -print -quit)" ]; then echo "so:$so"; fi; \
+    done < /tmp/needed > /tmp/elf-deps; \
+    LC_ALL=C sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/minimap2/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    xargs apk add --no-cache ca-certificates tini < /tmp/runtime-deps; \
+    addgroup -g 1000 app; \
+    adduser -D -u 1000 -G app app; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "minimap2"]
+CMD ["--help"]
